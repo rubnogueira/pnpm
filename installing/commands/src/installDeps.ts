@@ -51,6 +51,7 @@ import {
   type UpdateDepsMatcher,
 } from './recursive.js'
 import { makeRunPacquet } from './runPacquet.js'
+import { recoverFromPartialSplit } from './splitLockfile.js'
 import { createWorkspaceSpecs, updateToWorkspacePackagesFromManifest } from './updateWorkspaceDependencies.js'
 import { verifyPacquetIdentity } from './verifyPacquetIdentity.js'
 
@@ -83,6 +84,7 @@ export type InstallDepsOptions = Pick<Config,
 | 'linkWorkspacePackages'
 | 'lockfileDir'
 | 'lockfileOnly'
+| 'lockfileStorage'
 | 'pnprServer'
 | 'production'
 | 'preferWorkspacePackages'
@@ -177,6 +179,13 @@ export async function installDeps (
   opts: InstallDepsOptions,
   params: string[]
 ): Promise<void> {
+  // In split lockfile mode, recover from an interrupted previous split before
+  // the optimistic up-to-date check. That check can otherwise skip the whole
+  // install (and thus the recovery inside `recursive`) while a stale unified
+  // root lockfile and sentinel are left behind.
+  if (opts.lockfileStorage === 'split' && opts.workspaceDir) {
+    await recoverFromPartialSplit(opts.workspaceDir)
+  }
   if (!opts.update && !opts.dedupe && params.length === 0 && opts.optimisticRepeatInstall) {
     const { upToDate } = await checkDepsStatus({
       ...opts,

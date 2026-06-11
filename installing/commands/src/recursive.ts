@@ -56,6 +56,7 @@ import { getPinnedVersion } from './getPinnedVersion.js'
 import { getSaveType } from './getSaveType.js'
 import { handleIgnoredBuilds } from './handleIgnoredBuilds.js'
 import { type PolicyViolation, setupPolicyHandlers } from './policyHandlers.js'
+import { mergePerPackageLockfiles, recoverFromPartialSplit, splitUnifiedLockfile } from './splitLockfile.js'
 import { createWorkspaceSpecs, updateToWorkspacePackagesFromManifest } from './updateWorkspaceDependencies.js'
 
 export type RecursiveOptions = CreateStoreControllerOptions & Pick<Config,
@@ -72,6 +73,7 @@ export type RecursiveOptions = CreateStoreControllerOptions & Pick<Config,
 | 'linkWorkspacePackages'
 | 'lockfileDir'
 | 'lockfileOnly'
+| 'lockfileStorage'
 | 'modulesDir'
 | 'pnprServer'
 | 'allowBuilds'
@@ -310,6 +312,57 @@ export async function recursive (
       throw new PnpmError('NO_PACKAGE_IN_DEPENDENCIES',
         'None of the specified packages were found in the dependencies of any of the projects.')
     }
+    // `lockfileStorage: split` keeps per-package lockfiles on disk but runs the
+    // fast shared-resolution path here. Before resolving, merge the per-package
+    // lockfiles into one unified lockfile at the workspace root (recovering from
+    // any interrupted previous split first); after resolving, split it back.
+    const isSplitMode = opts.lockfileStorage === 'split'
+    const splitModeProjectDirs = isSplitMode ? allProjects.map((project) => project.rootDir) : []
+    let splitModeHooks: typeof installOpts.hooks | undefined
+    let splitModePnpmfileChecksums: Map<ProjectRootDir, string | undefined> | undefined
+    if (isSplitMode) {
+      await recoverFromPartialSplit(opts.workspaceDir)
+      await mergePerPackageLockfiles(opts.workspaceDir, splitModeProjectDirs)
+      // The single shared resolution only loads the workspace-root `.pnpmfile`
+      // by default. Mirror the legacy per-project path (which calls
+      // `requireHooks(rootDir)` for every project) by also loading each
+      // project's own `.pnpmfile` and composing their `readPackage` hooks into
+      // the one resolution. Per-project hooks of this kind are keyed on the
+      // package they target (via `pkg.name`), so running every project's hook on
+      // every package is safe: only the matching importer's hook rewrites it,
+      // and workspace-wide hooks (e.g. version pins) are idempotent. The
+      // workspace-root hooks already live in `installOpts.hooks`, so they are
+      // appended last to preserve the legacy `[project, root]` ordering. Only
+      // `readPackage` is composed; per-project `afterAllResolved` (which expects
+      // a single-project lockfile) is intentionally not merged. Each project's
+      // own pnpmfile checksum is captured so the split step can re-stamp the
+      // per-package lockfiles (the unified lockfile only tracks the root one).
+      if (!opts.ignorePnpmfile) {
+        const perProjectHooks = await Promise.all(
+          splitModeProjectDirs.map(async (projectDir) => {
+            const { hooks: projectHooks } = await requireHooks(projectDir, opts)
+            return {
+              projectDir,
+              readPackage: projectHooks.readPackage ?? [],
+              pnpmfileChecksum: await projectHooks.calculatePnpmfileChecksum?.(),
+            }
+          })
+        )
+        const perProjectReadPackage = perProjectHooks.flatMap((entry) => entry.readPackage)
+        if (perProjectReadPackage.length > 0) {
+          splitModeHooks = {
+            ...installOpts.hooks,
+            readPackage: [
+              ...perProjectReadPackage,
+              ...(installOpts.hooks?.readPackage ?? []),
+            ],
+          }
+        }
+        splitModePnpmfileChecksums = new Map(
+          perProjectHooks.map((entry) => [entry.projectDir, entry.pnpmfileChecksum])
+        )
+      }
+    }
     const {
       updatedCatalogs,
       updatedProjects: mutatedPkgs,
@@ -317,9 +370,13 @@ export async function recursive (
       resolutionPolicyViolations,
     } = await mutateModules(mutatedImporters, {
       ...installOpts,
+      ...(splitModeHooks ? { hooks: splitModeHooks } : {}),
       storeController: store.ctrl,
       resolutionVerifiers: store.resolutionVerifiers,
     })
+    if (isSplitMode) {
+      await splitUnifiedLockfile(opts.workspaceDir, splitModeProjectDirs, splitModePnpmfileChecksums)
+    }
     if (opts.save !== false) {
       // Only pick entries when we'll actually persist. Otherwise the
       // info log would claim entries were added that the workspace
